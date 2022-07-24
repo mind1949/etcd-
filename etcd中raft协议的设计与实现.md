@@ -1,0 +1,187 @@
+# etcd 中 raft 协议的设计与实现
+
+## 待解决问题
+
+- [ ] etcd/raft
+  - [ ] etcd/raft 如何实现 [raft-extended](https://raft.github.io/raft.pdf)
+    - [ ] 日志复制
+    - [ ] 领导选举
+    - [ ] 成员变更
+    - [ ] leader transfer
+  - [ ] 作为工业级实现, etcd/raft 有哪些优化
+    - [ ] 目的是什么?
+    - [ ] 原理是什么?
+    - [ ] 如何自己实现?
+  - [ ] 整理评价 etcd/raft 的设计与实现
+    - [ ] 宏观上 etcd/raft 是如何设计实现 raft 协议的?
+    - [ ] 让它成为工业级实现的点是什么?
+    - [ ] 有哪些缺点?
+    - [ ] 怎样做更好?
+
+# 日志复制
+
+## 学习记录
+
+### 主要组件
+
+| 名称                                    | 作用 |
+| --------------------------------------- | ---- |
+| raft/node.go.Node                       |      |
+| raft/node.go.node                       |      |
+| raft/rawnode.go.RawNode                 |      |
+| raft/raft.go.raft                       |      |
+| raft/tracker/tracker.go.ProgressTracker |      |
+| raft/unstable.go.unstable               |      |
+|                                         |      |
+|                                         |      |
+|                                         |      |
+
+### Propose 流程
+
+```mermaid
+sequenceDiagram
+	participant server/etcdserver/raftNode
+	participant raft/node
+	participant raft/RawNode
+	participant raft/raft
+	participant raft/raftLog
+
+	server/etcdserver/raftNode ->> raft/node: ctx, data([]byte)
+	activate raft/node
+	raft/node ->> raft/node: Propose(ctx, data)
+  raft/node ->> raft/node: m = pb.Message{ Type: pb.MsgProp,<br> Entries: []pb.Entry{{Data: data}}}
+  raft/node ->> raft/node: stepWait(ctx,m)
+  raft/node ->> raft/node: stepWithWaitOption(ctx, m, true)
+  raft/node ->> raft/node: n.propc <- m
+  loop m := <- n.propc
+    raft/node ->> raft/node: m.From = n.r.id
+    raft/node ->> raft/raft: m
+    activate raft/raft
+    raft/raft ->> raft/raft: r.Step(m)
+    raft/raft ->> raft/raft: r.step(r, m)
+      alt is leader
+				raft/raft ->> raft/raft: stepLeader(r, m)
+				raft/raft ->> raft/raft: accepted := r.appendEntries(m.Entries...)
+				raft/raft ->> raft/raftLog: es := m.Entries
+				raft/raftLog ->> raft/raftLog: li := raftLog.lastIndex()
+				raft/raftLog -->> raft/raft: li
+				raft/raft ->> raft/raft: 循环赋值 es: <br> m.Entries[i].Term = r.Term, <br> m.Entries[i].Index = li + 1 + uint64(i)
+				raft/raft ->> raft/raft: exceedLimit := increaseUncommittedSize(es)
+				alt exceedLimit
+					raft/raft ->> raft/raft: accepted := false
+				else !exceedLimit
+					%%	r.prs.Progress[r.id].MaybeUpdate(li)
+					%%	// Regardless of maybeCommit's return, our caller will call bcastAppend.
+					%%	r.maybeCommit()
+					raft/raft ->> raft/raftLog: ents := es
+					raft/raftLog ->> raft/unstable: ents
+					raft/unstable ->> raft/unstable: unstable.truncateAndAppend(ents)
+					raft/raftLog ->> raft/raft: li := l.lastIndex()
+					raft/raft ->> raft/tracker/Progress: r.prs.Progress[r.id].MaybeUpdate(li) <br> n := li
+					raft/tracker/Progress ->> raft/tracker/Progress: pr.MaybeUpdate(n)
+					alt pr.Match > n
+						raft/tracker/Progress ->> raft/tracker/Progress: pr.Match = n <br> pr.ProbAcked()
+					end
+					raft/tracker/Progress ->> raft/tracker/Progress: pr.Next = max(pr.Next, n+1)
+					raft/raft ->> raft/raft: r.maybeCommited()
+					raft/raft ->> raft/raft: 通过计算 commitIndex <br> mci := r.prs.Committed()
+					raft/raft ->> raft/raftLog: r.raftLog.maybeCommit(mci, r.Term) <br> maxIndex := mci  term := r.Term
+					%% 保存非持久化状态 commitIndex 到内存中
+					raft/raftLog ->> raft/raftLog: 若 maxIndex > l.committed 则 l.commitTo(maxIndex)
+
+					raft/raft ->> raft/raft: accepted := true
+				end
+				alt accepted
+					raft/raft ->> raft/raft: r.bcastAppend()
+					raft/raft ->> raft/raft: 根据每个 follower 节点进度, 查出需要复制的 entries,<br> 拼出 MsgApp 类型的 msg, <br>标记 msg.To = follower节点 id,<br> append 到 r.msg中 <br> 等待应用处理
+					raft/raft -->> raft/node: return nil
+				else !accepted
+					raft/raft -->> raft/node: return ErrProposalDropped
+				end
+      else is follower
+				raft/raft ->> raft/raft: stepFollower(r, m)
+				alt !disableProposalForwarding
+					raft/raft ->> raft/raft: m.To = r.lead 通过 r.send(m) 将m追加到 r.msg 中
+				end
+				raft/raft -->> raft/node: return nil
+      else is candidate
+      	raft/raft ->> raft/raft: stepCandidate(r, m)
+      	raft/raft -->> raft/node: return ErrProposalDropped
+      end
+    deactivate raft/raft
+  end
+
+	raft/node -->> server/etcdserver/raftNode: err
+	deactivate raft/node
+
+```
+
+#### 疑问
+
+##### 关于 leader 对自身 nextIndex 与 matchIndex 的更新
+
+ leader 在没有将 entries 追加到持久层的时候就更新了自己的 nextIndex 和 matchIndex
+如果应用后面没有成功持久化 entries 怎么办?
+
+##### ~~关于 propose 与 apply 和 用户查询修改状态的异步问题~~
+
+现在发现在 Propose的时候 raft/raft.appendEntry 中执行 maybeCommit() 计算保存 commitIndex,
+
+并不是 append entries --> replicate to followers --> commit entries --> apply entries 这样一个顺序执行的流程
+
+而是一个异步的流程, 这样怎么保证用户 propose 后, 再查询会得到最新的结果?
+
+###### 答案
+
+server/etcdserver/Etcdserver 通过 wait/Wait.register 和 trigger 完成变异步为同步
+
+### Ready() 处理流程
+
+```mermaid
+sequenceDiagram
+	participant server/etcdserver/raftNode
+	participant raft/node
+	participant raft/RawNode
+	participant raft/raft
+	participant raft/raftLog
+
+		server/etcdserver/raftNode ->>+ raft/node: <-r.Ready()
+    ALT n.rn.HasReady()
+      raft/node ->> raft/RawNode: n.rn.readyWithoutAccept()
+      raft/RawNode ->> raft/raft: newReady(rn.raft, rn.prevSoftSt, rn.prevHardSt)
+      raft/raft ->> raft/raftLog: r.raftLog.unstableEntries()
+      raft/raftLog ->> raft/unstable: l.unstable.entries
+      raft/unstable -->> raft/raftLog: unstable.entries
+      raft/raftLog ->> raft/raft: unstableEntries
+      raft/raft ->> raft/raftLog: r.raftLg.nextEnts()
+      raft/raftLog ->> raft/raftLog: l.nextEnts()
+      raft/raftLog ->> raft/raftLog: off := max(l.applied+1, l.firstIndex())
+      ALT l.committed+1 > off
+      	raft/raftLog ->> raft/raftLog: ents, _ := l.slice(off, l.committed+1, l.maxNextEntsSize)
+      	raft/raftLog -->> raft/raft: nextEnts := ents
+      ELSE l.committed+1 <= off
+      	raft/raftLog -->> raft/raft:  nextEnts := nil
+      END
+      raft/raft ->> raft/raft: rd := Ready{<br>Entries: unstableEntries, <br>CommittedEntries: netxEnts, <br>Messages: r.msg}
+      raft/raft ->> raft/raft: rd.MustSync = true
+  		raft/raft -->> raft/node: rd
+  		raft/node -->> server/etcdserver/raftNode: rd
+    ELSE !n.rn.HasReady()
+      raft/node ->> raft/node: block
+    END
+
+    ALT isLead
+    	server/etcdserver/raftNode ->> server/etcdserver/raftNode: r.transport.Send(r.processMessages(rd.Messages))
+    END
+    server/etcdserver/raftNode ->> server/etcdserver/raftNode: r.storage.Save(rd.HardState, rd.Entries)
+    server/etcdserver/raftNode ->> server/etcdserver/raftNode: r.raftStorage.Append(rd.Entries)
+    ALT !isLead
+    	server/etcdserver/raftNode ->> server/etcdserver/raftNode: msgs := r.processMessages(rd.Messages) <br> notifyc <- struct{}{} <br> r.transport.Send(msgs)
+    ELSE isLead
+   		server/etcdserver/raftNode ->> server/etcdserver/raftNode: notifyc <- struct{}{}
+    END
+
+```
+#### 疑问
+##### follower 在接收到消息后做了什么? 什么时候 leader 会更新所有 follower 节点的 nextIndex 和 matchIndex 更新, 并计算 commitIndex ?
+
